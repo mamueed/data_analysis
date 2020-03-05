@@ -1,0 +1,834 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+
+Santander Cycles is an organisation in London that works to provide bike-sharing as a mode of transportation to the people of London. After the involvement of Boris Johnson, the mayor of London the usage of bikes has significantly grown over the period. In this particular assignment, we are trying to see the challenges of bike-sharing and predicting their demand on an hourly basis. 
+Based on the information provided at [TFL](https://tfl.gov.uk/modes/cycling/santander-cycles), The people could walk to any bike-sharing station with a credit/debit card, get a release code for the bike, check for the condition of the bike, and take the bike. After the journey completion, they would return the bike to the nearest bike station of destination. 
+The cost of each journey is 
+*	Pay £2 to access the bikes for 24 hours.
+*	The user can make as many journeys as they like if the journey is less than 30 minutes, no need to pay more. If it is longer than 30 minutes, then they pay £2 for every 30 minutes.
+*	The user can return the bike at any time, as long as it is within 24 hours. The user could be charged up to £300 if there are any damages to the bike or if the user does not return it.
+These are the standard rules available for all the users of bike-sharing be it registered or casual users.
+
+### LIBRARIES:
+We would require the following libraries for achieving our goal for the project. The descriptions and uses of each library are given in the comments.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse) # for all data related operations
+library(lubridate) # for handling date related data
+library(xgboost) # for the algorithm
+library(Amelia) # To check for any missing values in the dataset
+library(lubridate) # To help in working with the date functions
+library(reshape2) # to help in creating the maps using shape files
+library(rgdal) # to help in creating maps
+library(arules) #To perform associate rules 
+library(caTools) # To split data into test and train.
+library(GGally) # To plot corelation graphs
+library(caret) #to perform CV and linear models
+library(e1071) # XGB linear
+library(rpart)
+library(rattle) #these libraries will be used to get a good visual plot for the decision tree model. 
+library(rpart.plot)
+library(RColorBrewer)
+```
+
+
+### DATASET:
+The data set provided by TFL(Transport for London), for two months which have complete information about the Bike journeys, Bike stations and London Census.  The information about each data set is as displayed from the glimpse function. 
+
+```{r message=FALSE, warning=FALSE}
+census = read.csv("Data/London_census.csv")
+journeyBike = read_csv("Data/bike_journeys.csv")
+stationsBike = read.csv("Data/bike_stations.csv")
+
+glimpse(census)
+glimpse(journeyBike)
+glimpse(stationsBike)
+```
+
+Checking the data for any missing values. The below mismap function checks for any NA values
+
+```{r message=FALSE, warning=FALSE}
+missmap(journeyBike)
+missmap(stationsBike)
+missmap(census)
+```
+
+### HYPOTHESIS:
+
+Bike Sharing is an excellent concept which would help many of its users for ease of transportations in shorter journey durations. There could be many things that affect the usage of bike journeys.
+
+**Hour:** The hour of the day affects with the usage of bikes as many people who go to work or need to reach any other station would prefer to go on a bike for their ease of transport. 
+**Weekends/Holidays:** The holidays and weekends may also affect the number of bike riders usage. 
+**Population**: Population in the area can have a positive impact on the number of bike usage rides. 
+**Job**: The number of people working will be using the bikes more often in any place. 
+**Temperature**: Temperature also has a positive effect on bike usage. 
+**Climate Conditions**: The climate effects like rain, wind, fog etc. can also alter the decisions of a bike ride. 
+**Other Transport stations**: Having other transport stations like Bus, Coach, tube, tram in the vicinity could also affect the bike share usage as people who need to use these services could reach to the nearby stations using bikes. 
+
+### DATA UNDERSTANDING & ACQUISITION:
+
+To prove our hypothesis, we have the data on population, jobs from the census table. We need data related to temperature, climate conditions and other transport stations. To plot the effects of the above on the map of London, we need the London map shapefiles. 
+I have web scraped the data using python scripts for the above from the below websites
+*	Weather Data – https://www.wunderground.com/history/daily/gb/london/EGLC
+*	Transport Stations – https://en.wikipedia.org/
+*	Shape Files – https://data.london.gov.uk/dataset/statistical-gis-boundary-files-london
+
+Loading the files to see their structures using glimpse
+
+
+```{r message=FALSE, warning=FALSE}
+
+weather = read.csv("Data/londonweather_aug.csv")
+busCoach = read.csv("Data/londonbusandcoach.csv")
+trainStations = read.csv("Data/londontrains.csv")
+tube = read.csv("Data/londontube.csv")
+
+glimpse(weather)
+glimpse(busCoach)
+glimpse(trainStations)
+glimpse(tube)
+
+```
+
+### HYPOTHESIS ANALYSIS:
+
+**Merging of data sets.** 
+
+Getting the counts of number of stations by each borough
+```{r}
+trainStations = trainStations %>%
+  group_by(Borough)%>%
+  summarise(stnCount = dplyr::n())
+tube = tube %>%
+  group_by(Borough)%>%
+  summarise(stnTubeCount = dplyr::n())
+busCoach = busCoach %>%
+  group_by(Borough)%>%
+  summarise(stnBusCount = dplyr::n())
+```
+
+merging the station, census and journey data set. The primary dataset
+
+```{r}
+journey1 = journeyBike
+
+journey1=journey1 %>%
+  unite(JDate, c("Start_Date","Start_Month","Start_Year"),sep="/")
+
+journey1$JDate = as.Date(journey1$JDate,format = "%d/%m/%y")
+
+journey1 = journey1 %>% 
+  group_by(JDate,Start_Hour,Start_Station_ID)%>%
+  summarise(count=dplyr::n())
+
+journey1 = journey1 %>%
+  mutate(sTripDay = wday(JDate))%>%
+  mutate(sTrpDayType = ifelse(sTripDay %in% c(1,7),0,1))
+
+journey1
+```
+Finding the wardcode associated with each station ID using kmeans
+
+```{r}
+#removing the NA value in census data
+census %>%
+  mutate(borough = ifelse(WardCode == "E09000001","City of London",as.character(borough))) -> census
+names(stationsBike)[names(stationsBike) == "Latitude"] <- "lat"
+names(stationsBike)[names(stationsBike) == "Longitude"] <- "lon"
+combined =rbind(census[,c("lon","lat")],stationsBike[,c("lon","lat")],use.names=FALSE)
+combined =combined[-1399,]
+clusters = kmeans(combined,combined[1:625,],iter.max=1)
+stationsBike$stationWard = census$WardName[clusters$cluster[626:nrow(combined)]]
+stationsBike
+```
+Merging all three datasets using Wardcode and station id
+
+```{r}
+station1 = stationsBike
+colnames(station1) <- paste("Start", colnames(station1), sep = "_")
+names(station1)
+
+bikeStations = merge(journey1,station1,by="Start_Station_ID")
+
+census1=census
+names(census1)[names(census1) == "WardName"] <- "Start_stationWard"
+
+bikeStations = merge(bikeStations,census1, by="Start_stationWard")
+
+bikeStations = bikeStations %>%
+  mutate(Start_date = day(JDate))%>%
+  mutate(Start_Month = month(JDate))
+
+glimpse(bikeStations)
+```
+
+Checking the effect of an hour on the bike data
+
+```{r}
+b1 = bikeStations %>%
+  group_by(Start_Hour)%>%
+  summarize (cnt_start = sum(count))
+b1 = b1[order(-b1$cnt_start),]
+b1
+ggplot()+
+  geom_col(data = b1, mapping = aes(x=Start_Hour, y=cnt_start),color="blue")
+
+```
+
+Seeing the above graph, we can understand that there is an impact related to the hours. During the work start and end hours, we see a peak in the number of bike rides. 
+
+Weekdays and weekend analysis to see for any inferences
+```{r}
+bikeStations %>%
+  group_by(sTripDay)%>%
+  summarise(cnt=sum(count))%>%
+  ggplot()+
+  geom_col(mapping = aes(x=sTripDay, y=cnt),color="blue")
+              
+```
+
+The above graph shows there is a slight reduction in the number of bike rides over the weekends compared to weekdays. This may be due to the above factor where there is considerable demand for bike journeys during the working hours. 
+
+Let us divide the time frame to bins for a better understanding
+
+
+```{r fig.width=10,fig.align = "center"}
+wkday = bikeStations
+wkday$Start_Hour =as.numeric(wkday$Start_Hour)
+
+
+wkday$start_time_category = case_when(
+between(wkday$Start_Hour,0,5) ~"Early Morning",
+between(wkday$Start_Hour,6,9) ~"Morning",
+between(wkday$Start_Hour,10,14) ~"Afternoon",
+between(wkday$Start_Hour,15,19) ~"Evening",
+TRUE ~"Night")
+
+
+# Daily Rides by time
+time_period_day <- wkday %>% 
+                     group_by(start_time_category,sTripDay) %>% 
+                     dplyr::summarise(total=sum(count))
+time_period_day$period <- factor(time_period_day$start_time_category, 
+                                 levels=c("Early Morning","Morning","Afternoon","Evening","Night"))
+
+#create theme
+my_theme <- function(){
+  theme_minimal()+
+    theme(plot.title=element_text(hjust=0.5),plot.background = element_rect(fill = "grey95"),
+          panel.grid.major = element_line(colour="grey80"))
+}  
+
+ggplot(time_period_day,aes(x=sTripDay,y=total))+
+  geom_col(fill="dodgerblue4")+
+  my_theme()+
+  labs(title="Total Number of Daily Rides",x="Day",y="Number of Rides")+
+  facet_grid(~period)
+```
+
+Based on these bins, we see that the morning and evening rides have an impact based on the weekdays and weekends there is no demand in the morning time.  
+
+Checking the average number of rides per each weekday  
+```{r echo=FALSE, fig.width=8, message=FALSE, warning=FALSE}
+number_days <- wkday %>%
+  filter(sTrpDayType==1) %>% 
+  group_by(month(JDate),week(JDate),sTripDay) %>% 
+  summarise(Count=sum(count))
+table(number_days$sTripDay)  
+
+daily_avg <- wkday %>% 
+  filter(sTrpDayType==1) %>% 
+  group_by(start_time_category,sTripDay) %>% 
+  summarise(total=sum(count))%>%
+  mutate(number_occur=c(7,8,7,7,7),avg=total/number_occur)
+
+daily_avg$period <- factor(daily_avg$start_time_category, levels=c("Early Morning","Morning","Afternoon","Evening","Night"))    
+ggplot(daily_avg, aes(x=sTripDay,y=avg))+
+  geom_col(fill="dodgerblue4")+
+  facet_grid(~period)+
+  labs(x="Day",y="Average Number of Rides",title="Daily Weekday Average")+
+  my_theme()
+```
+The average rides are higher in the evening period and similar during the morning and afternoon periods. We could understand that the evening rides are higher as the casual users come out during afternoon and evening for the leisure rides along with the working population. 
+
+Creating the map of London to see the orientation of employees, population density along with the bike stations with higher counts in rides. To see how the places with these factors affect the rides. 
+```{r message=FALSE, warning=FALSE}
+ldn1 <- readOGR("maps/London_Borough_Excluding_MHW.shp", layer = "London_Borough_Excluding_MHW")
+proj4string(ldn1) <- CRS("+init=epsg:27700")
+ldn1.wgs84 <- spTransform(ldn1, CRS("+init=epsg:4326"))
+map1 <- ggplot(ldn1.wgs84) +
+  geom_polygon(aes(x = long, y = lat, group = group), fill = "white", colour = "black")
+map1 + labs(x = "Longitude", y = "Latitude", title = "Map of Greater London with the borough boundaries")
+```
+
+plotting the data points on the london map
+
+```{r}
+map1 + geom_point(data = census,aes(x=lon,y = lat, color = NoEmployee ))+
+  geom_point(data = bikeStations,aes(x=Start_lon,y=Start_lat, color=Station_ID),color="red")
+```
+The map looks difficult to read, Plotting the central london map
+
+```{r message=FALSE, warning=FALSE}
+ldn2 <- readOGR("maps1/lp-consultation-oct-2009-central-activities-zone.shp", layer = "lp-consultation-oct-2009-central-activities-zone")
+proj4string(ldn2) <- CRS("+init=epsg:27700")
+ldn2.wgs84 <- spTransform(ldn2, CRS("+init=epsg:4326"))
+map2 <- ggplot(ldn2.wgs84) +
+  geom_polygon(aes(x = long, y = lat, group = group), fill = "white", colour = "black")
+map2 + labs(x = "Longitude", y = "Latitude", title = "Map of Central London")
+```
+
+Let us find the stations with highest count
+```{r}
+s1 = bikeStations %>%
+  group_by(Start_Station_ID)%>%
+  summarise(cnt=sum(count))
+s1 = s1[order(-s1$cnt),]
+head(s1)
+```
+
+plotting these stations along with No. of employees
+```{r}
+c1 = census %>%
+  filter(NESW == "Central")
+s2 = stationsBike %>%
+  filter(Station_ID %in% c(14,191,154,303,248,307))
+map2 + geom_point(data = c1,aes(x=lon,y = lat, color = NoEmployee )) +
+  geom_point(data = s2,aes(x=lon,y=lat, color=Station_ID),color="red")
+```
+Seeing the above graph we can safely say that employee count has a trend with the top performing station id
+
+Plotting the stations based on population density
+
+```{r}
+c1 = c1 %>%
+  mutate(pop = PopDen * AreaSqKm)
+
+map2 + geom_point(data = c1,aes(x=lon,y = lat, color = pop )) +
+  geom_point(data = s2,aes(x=lon,y=lat, color=Station_ID),color="red")
+
+```
+ The above graph shows a relation but we cannot predict the relation with population count
+ 
+```{r}
+
+bikeStations%>%
+  select(count,NoEmployee,PopDen,AreaSqKm)%>%
+  cor()
+
+```
+ 
+The above corelations show that NoEmployee has a positive relation with count and so does the area of that borough. But density shows a negative impact. plotting the graph for a better understanding.
+
+```{r}
+pl <- ggplot(bikeStations,aes(sTripDay,count)) + geom_col(aes(color=NoEmployee),alpha=0.5,width = 0.5)
+pl + scale_color_continuous(low = '#55D8CE',high = '#FF6E2E') + theme_bw()
+```
+
+let us see the effect of weather on the count of bike share rides. 
+```{r}
+weather$date = dmy(weather$date)
+weather = weather %>%
+  mutate(id = paste(date,Time, sep="-"))
+
+bikeStations1 = bikeStations %>%
+  mutate(id = paste(JDate,Start_Hour,sep="-"))
+
+wbike = merge(bikeStations1,weather,by="id")
+```
+Plotting the graph to see the count and its effect with temperature
+
+```{r}
+p2 <- ggplot(wbike,aes(sTripDay,count)) + geom_col(aes(color=Temperature),alpha=0.5,width = 0.5)
+p2 + scale_color_continuous(low = '#55D8CE',high = '#FF6E2E') + theme_bw()
+
+```
+As per the above graph we can see that the temperature has a positive impact on the count, as the temperature is high the count is higher. 
+
+Let us alo check the count based on the climate condition.
+```{r}
+wbike %>%
+  group_by(Condition)%>%
+  summarise(cnt=sum(count))%>%
+  ggplot()+
+  geom_col(mapping = aes(x=Condition, y=cnt),color="blue")+coord_flip()
+```
+The above graph, clearly shows that the fair weather conditions favour for more number of rides. 
+
+let us see the affect of having other transport stations nearby with the count.
+
+```{r}
+tube = tube %>%
+  group_by(Borough) %>%
+  summarise(tubeCnt = n())%>%
+  rename(borough = Borough)
+trainStations = trainStations %>%
+  group_by(Borough) %>%
+  summarise(trCnt = n())%>%
+  rename(borough = Borough)
+busCoach = busCoach %>%
+  group_by(Borough) %>%
+  summarise(busCnt = n())%>%
+  rename(borough = Borough)
+stnBike=merge(census,tube,by="borough")
+stnBike=merge(stnBike,trainStations,by="borough")
+stnBike=merge(stnBike,busCoach,by="borough")
+
+stnBike = stnBike %>%
+  select(borough,tubeCnt,busCnt,trCnt)
+
+transBike = merge(wbike,stnBike, by = "borough")
+
+summary(transBike$trCnt)
+```
+
+Seeing the above output we cannot conclude anything as it looks we have a different borough name from the webscraped data. this required more data to make any confirmations. 
+### Association Rules 
+From the journeys dataset, we see that each journey ID can perform multiple journeys in a day, using Associate Rules rules let us try to find the most common routes taken by users.
+
+```{r}
+rou = read.transactions("routes2.csv",format = "single",header = TRUE,sep =",",cols = c(1,2))
+#inspect(head(rou))
+frequent = eclat(rou,list(supp = 0.001,maxlen = 4))
+#inspect(head(frequent))
+rules = apriori(rou,parameter = list(supp = 0.001,conf = 0.001))
+inspect(head(rules))
+rules_conf = sort(rules,by="confidence",decreasing = TRUE)
+inspect(head(rules_conf))
+```
+
+The lift value fpr the above association rules show that its 1, This could mean that these association rules are by a coincidence and the choice of routes are very random. It could be because of the business rule of returning the bike under 30 minutes. 
+
+### Modelling:
+
+```{r}
+# Choosing all relevant variables to perform the regression
+cenBike = bikeStations %>%
+    select(Start_Station_ID,Start_Hour,sTrpDayType,sTripDay,Start_Capacity,AreaSqKm,IncomeScor,LivingEnSc,NoEmployee,GrenSpace,PopDen,BornUK,NotBornUK,NoCTFtoH,NoDwelling,NoFlats,NoHouses,NoOwndDwel,MedHPrice,Start_date,Start_Month,count)
+
+# Feature engineering for some of the variables
+wbike_f = cenBike %>%
+  mutate(ratioemp = NoEmployee/(PopDen * AreaSqKm)) %>%
+  mutate(ratioBornUK = BornUK/(BornUK + NotBornUK)) %>%
+  mutate(ratioCTF = NoCTFtoH/NoDwelling) %>%
+  mutate(ratioOwnDwelling = NoOwndDwel / NoDwelling)
+
+wbike_f$AreaSqKm = NULL
+wbike_f$PopDen = NULL
+wbike_f$NoEmployee = NULL
+wbike_f$BornUK = NULL
+wbike_f$NotBornUK = NULL
+wbike_f$NoCTFtoH = NULL
+wbike_f$NoDwelling = NULL
+wbike_f$NoOwndDwel = NULL
+
+summary(wbike_f)
+
+```
+Normalizing the data using log transformation as they are not normally distributed.
+```{r fig.width=10}
+wbike_f$ratioBornUK = log10(wbike_f$ratioBornUK +
+                              min(wbike_f[wbike_f$ratioBornUK!=0,]$ratioBornUK))
+wbike_f$ratioCTF = log10(wbike_f$ratioCTF + min(wbike_f[wbike_f$ratioCTF!=0,]$ratioCTF))
+
+# finding corelations
+ggcorr(wbike_f, label = TRUE)
+```
+
+Based on the above graph we see that income score, No Flats,NoHouses and MedHprice are corelated
+```{r fig.width=10}
+# Removing the corelated values
+
+wbike_f$MedHPrice = NULL
+wbike_f$NoHouses = NULL
+wbike_f$NoFlats = NULL
+wbike_f$IncomeScor = NULL
+wbike_f$Start_Month = NULL # removing month as we just have 2 months data and that is not significant
+wbike_f$Start_date = NULL # Removing data for the same reasons, we are having day type which gives the significance
+
+#checking the corelation again
+ggcorr(wbike_f, label = TRUE)
+
+#converting the factor variables to factors
+#wbike_f$Start_Station_ID = as.factor(wbike_f$Start_Station_ID)
+wbike_f$Start_Hour = as.factor(wbike_f$Start_Hour)
+wbike_f$sTrpDayType = as.factor(wbike_f$sTrpDayType)
+wbike_f$sTripDay = as.factor(wbike_f$sTripDay)
+
+```
+Splitting the dataset into test and train data
+
+```{r}
+sample = sample.split(wbike_f$count, SplitRatio = 0.8)
+train_bc = subset(wbike_f, sample == TRUE)
+test_bc = subset(wbike_f, sample == FALSE)
+```
+
+Creating functions to calculate RMSE, R squared
+```{r}
+#rmse
+rmse = function(m, o){
+  sqrt(mean((m - o)^2))
+}
+#R squared
+rsq =function(p,o){
+  1-((sum((p-o)^2))/sum((o-mean(o))^2))
+}
+```
+**Poisson Regression** involves regression models in which the response variable is in the form of counts and not fractional numbers. For example, the count of number of births or number of wins in a football match series. As we are predicting the count of rides for each hour at each station id, we will go ahead with poisson Regression. 
+```{r}
+fit <- glm(count ~ ., data=train_bc, family="poisson")
+
+X_test = test_bc %>% select(-count)
+
+preds = predict(fit, X_test , type="response", se.fit=TRUE)
+
+results <- tibble(cnt_actual = test_bc$count,
+                  cnt_pred= round(preds$fit) )
+results %>%
+    mutate(resid=cnt_actual - cnt_pred) %>%
+    mutate(resid_sq = resid^2) %>%
+    summarise(MSE=mean(resid_sq))
+
+print(rmse(results$cnt_pred,results$cnt_actual))
+print(rsq(results$cnt_pred,results$cnt_actual))
+
+```
+
+As the independent variables show very low correlation with the dependant count variable, We could use xgboost to help the weak learners perform in a better way. Using the caret library, we could also do a cross-validation to improve our results and to make sure the complete dataset is used to train. 
+
+using **XGB Linear** from the caret package
+```{r}
+train_bc$count = log1p(train_bc$count)
+# converting factor to numeric variables
+train_bc$Start_Hour = as.numeric(train_bc$Start_Hour)
+train_bc$sTrpDayType = as.numeric(train_bc$sTrpDayType)
+train_bc$sTripDay = as.numeric(train_bc$sTripDay)
+
+#converting factor to numeric in test
+test_bc$Start_Hour = as.numeric(test_bc$Start_Hour)
+test_bc$sTrpDayType = as.numeric(test_bc$sTrpDayType)
+test_bc$sTripDay = as.numeric(test_bc$sTripDay)
+
+dtrain = train_bc %>% as.matrix()
+
+
+ControlParamteres <- trainControl(method = "cv",
+                                  number = 5,
+                                  savePredictions = TRUE,
+                                  classProbs = FALSE)
+parametersGrid <-  expand.grid(eta = c(0.1), 
+                               nrounds=c(300,500),
+                               alpha = 0,
+                               lambda =1)
+ 
+modelxgboost <- train(count~., 
+                  data = dtrain,
+                  method = "xgbLinear",
+                  trControl = ControlParamteres,
+                  tuneGrid=parametersGrid)
+
+X_test = test_bc %>% select(-count) %>% as.matrix()
+preds = predict(modelxgboost, X_test)
+preds=expm1(preds)
+
+results <- tibble(cnt_actual = test_bc$count,
+                  cnt_pred=round(preds))
+results %>% 
+    mutate(resid=cnt_actual - cnt_pred) %>% 
+    mutate(resid_sq = resid^2) %>% 
+    summarise(MSE=mean(resid_sq))
+print(rmse(results$cnt_pred,results$cnt_actual))
+print(rsq(results$cnt_pred,results$cnt_actual))
+```
+
+By applying gradient boost, the results have a significant change and the MSE has also reduced this can help prove that XGBoost is a better model for this scenario than linear regression using Poisson distribution. 
+I am modifying the data as per business cases.
+1.	Considering all journeys within 90 mins considering some people may not find the bike station empty to dock their bike
+2.	Removing journeys where the start and end stations are the same, and the journey is under 2 minutes. As this could mean that the bike is faulty and the user has returned the bike. 
+
+Adding the weather components to the modelling data as we have seen from the hypothesis that they seem to have a good relation.
+
+```{r}
+journeyBike1 = journeyBike %>%
+  filter(!(Journey_Duration == 0)) %>%
+  filter(Journey_Duration < 9000) %>%
+  filter(!(Journey_Duration < 120 & Start_Station_ID==End_Station_ID) )
+
+journey2 = journeyBike1
+
+journey2=journey2 %>%
+  unite(JDate, c("Start_Date","Start_Month","Start_Year"),sep="/")
+
+journey2$JDate = as.Date(journey2$JDate,format = "%d/%m/%y")
+
+
+journey2 = journey2 %>% 
+  group_by(JDate,Start_Hour,Start_Station_ID)%>%
+  summarise(count=n())
+
+journey2 = journey2 %>%
+  mutate(sTripDay = wday(JDate))%>%
+  mutate(sTrpDayType = ifelse(sTripDay %in% c(1,7),0,1))
+
+bikeStations1 = merge(journey2,station1,by="Start_Station_ID")
+bikeStations1 = merge(bikeStations1,census1, by="Start_stationWard")
+
+bikeStations1 = bikeStations1 %>%
+  mutate(Start_date = day(JDate))%>%
+  mutate(Start_Month = month(JDate))
+
+weather$date = dmy(weather$date)
+
+weather = weather %>%
+  mutate(id = paste(date,Time, sep="-"))
+
+bikeStations1 = bikeStations1 %>%
+  mutate(id = paste(JDate,Start_Hour,sep="-"))
+
+wbike = merge(bikeStations1,weather,by="id")
+```
+selecting varibles for modelling
+
+```{r}
+wbike1 = wbike %>%
+  select(Start_Station_ID,Start_Hour,sTrpDayType,Start_Capacity,AreaSqKm,IncomeScor,LivingEnSc,NoEmployee,GrenSpace,PopDen,BornUK,NotBornUK,NoCTFtoH,NoDwelling,NoFlats,NoHouses,NoOwndDwel,MedHPrice,Start_date,Start_Month,Temperature,Dew,Humidity,Wind.Speed,Pressure,count)
+
+wbike_f = wbike1 %>%
+  mutate(ratioemp = NoEmployee/(PopDen * AreaSqKm)) %>%
+  mutate(ratioBornUK = BornUK/(BornUK + NotBornUK)) %>%
+  mutate(ratioCTF = NoCTFtoH/NoDwelling) %>%
+  mutate(ratioOwnDwelling = NoOwndDwel / NoDwelling)
+
+wbike_f$AreaSqKm = NULL
+wbike_f$PopDen = NULL
+wbike_f$NoEmployee = NULL
+wbike_f$BornUK = NULL
+wbike_f$NotBornUK = NULL
+wbike_f$NoCTFtoH = NULL
+wbike_f$NoDwelling = NULL
+wbike_f$NoOwndDwel = NULL
+
+summary(wbike_f)
+
+#normalizing tehe data by log
+wbike_f$ratioBornUK = log10(wbike_f$ratioBornUK +
+                              min(wbike_f[wbike_f$ratioBornUK!=0,]$ratioBornUK))
+wbike_f$ratioCTF = log10(wbike_f$ratioCTF + min(wbike_f[wbike_f$ratioCTF!=0,]$ratioCTF))
+
+# Removing corelated variables
+wbike_f$MedHPrice = NULL
+wbike_f$NoHouses = NULL
+wbike_f$NoFlats = NULL
+wbike_f$IncomeScor = NULL
+wbike_f$Start_Month = NULL # removing month as we just have 2 months data and that is not significant
+wbike_f$Start_date = NULL # Removing data for the same reasons, we are having day type which gives the significance
+
+```
+Running the algorithm
+
+```{r}
+sample = sample.split(wbike_f$count, SplitRatio = 0.8)
+train_bc = subset(wbike_f, sample == TRUE)
+test_bc = subset(wbike_f, sample == FALSE)
+
+train_bc$count = log1p(train_bc$count)
+
+dtrain = train_bc %>% as.matrix()
+
+
+ControlParamteres <- trainControl(method = "cv",
+                                  number = 5,
+                                  savePredictions = TRUE,
+                                  classProbs = FALSE)
+parametersGrid <-  expand.grid(eta = c(0.1), 
+                               nrounds=c(100,300,500),
+                               alpha = 0,
+                               lambda =1)
+ 
+modelxgboost <- train(count~., 
+                  data = dtrain,
+                  method = "xgbLinear",
+                  trControl = ControlParamteres,
+                  tuneGrid=parametersGrid)
+
+X_test = test_bc %>% select(-count) %>% as.matrix()
+preds = predict(modelxgboost, X_test)
+preds=expm1(preds)
+
+results <- tibble(cnt_actual = test_bc$count,
+                  cnt_pred=round(preds))
+results %>% 
+    mutate(resid=cnt_actual - cnt_pred) %>% 
+    mutate(resid_sq = resid^2) %>% 
+    summarise(MSE=mean(resid_sq))
+print(rmse(results$cnt_pred,results$cnt_actual))
+print(rsq(results$cnt_pred,results$cnt_actual))
+
+```
+As the dataset, has factor variables, and considering them as integers may skew the results. To avoid these we need to do feature engineering to include dummy variables. 
+**CLASSIFICATION**
+let us perform tree algorithm to divide the significant number of factors in multiple bins.
+```{r}
+#converting into hour bins
+d=rpart(count~Start_Hour,data=wbike)
+fancyRpartPlot(d)
+#converting stationID to bins
+wbike_s = wbike %>%
+  group_by(Start_Station_ID,JDate)%>%
+  summarise(cnt = sum(count))
+
+s=rpart(cnt~Start_Station_ID,data=wbike_s)
+fancyRpartPlot(s)
+
+```
+
+Now adding the bins
+```{r}
+wbike$HourType = 0
+wbike$HourType[wbike$Start_Hour < 7] = 1
+wbike$HourType[wbike$Start_Hour >=7 & wbike$Start_Hour < 17] = 2
+wbike$HourType[wbike$Start_Hour >=17 & wbike$Start_Hour < 20] = 3
+wbike$HourType[wbike$Start_Hour >=20] = 4
+
+wbike$StationID_type = 0
+wbike$StationID_type[wbike$Start_Station_ID <= 154] = 1
+wbike$StationID_type[wbike$Start_Station_ID > 154 & wbike$Start_Station_ID <=192] = 2
+wbike$StationID_type[wbike$Start_Station_ID > 192 & wbike$Start_Station_ID <=254] = 3
+wbike$StationID_type[wbike$Start_Station_ID > 254 & wbike$Start_Station_ID <=303] = 4
+wbike$StationID_type[wbike$Start_Station_ID > 303 & wbike$Start_Station_ID <=362] = 5
+wbike$StationID_type[wbike$Start_Station_ID > 362] = 6
+#bins for climate condition
+
+wbike$climateCond = 0
+wbike$climateCond[wbike$Condition %in% c("Cloudy","Cloudy / Windy","Mostly Cloudy",
+                                             "Mostly Cloudy / Windy","Partly Cloudy",
+                                             "Partly Cloudy / Windy","Fog")] = 1
+wbike$climateCond[wbike$Condition %in% c("Drizzle","Hail","Haze","Heavy Rain",
+                                             "Light Drizzle","Light Rain",
+                                             "Light Rain / Windy","Rain","T-Storm","Thunder in the Vicinity")] = 2
+wbike$climateCond[wbike$Condition %in% c("Fair","Fair / Windy")] = 3
+```
+
+getting the variables for modelling
+
+```{r}
+wbike1 = wbike %>%
+  select(sTripDay,sTrpDayType,Start_Capacity,AreaSqKm,IncomeScor,LivingEnSc,NoEmployee,GrenSpace,PopDen,BornUK,NotBornUK,NoCTFtoH,NoDwelling,NoFlats,NoHouses,NoOwndDwel,MedHPrice,Start_date,Start_Month,Temperature,Dew,Humidity,Wind.Speed,Pressure,HourType,StationID_type,climateCond,count)
+
+wbike_f = wbike1 %>%
+  mutate(ratioemp = NoEmployee/(PopDen * AreaSqKm)) %>%
+  mutate(ratioBornUK = BornUK/(BornUK + NotBornUK)) %>%
+  mutate(ratioCTF = NoCTFtoH/NoDwelling) %>%
+  mutate(ratioOwnDwelling = NoOwndDwel / NoDwelling)
+
+wbike_f$AreaSqKm = NULL
+wbike_f$PopDen = NULL
+wbike_f$NoEmployee = NULL
+wbike_f$BornUK = NULL
+wbike_f$NotBornUK = NULL
+wbike_f$NoCTFtoH = NULL
+wbike_f$NoDwelling = NULL
+wbike_f$NoOwndDwel = NULL
+
+
+#normalizing tehe data by log
+wbike_f$ratioBornUK = log10(wbike_f$ratioBornUK +
+                              min(wbike_f[wbike_f$ratioBornUK!=0,]$ratioBornUK))
+wbike_f$ratioCTF = log10(wbike_f$ratioCTF + min(wbike_f[wbike_f$ratioCTF!=0,]$ratioCTF))
+
+# Removing corelated variables
+wbike_f$MedHPrice = NULL
+wbike_f$NoHouses = NULL
+wbike_f$NoFlats = NULL
+wbike_f$IncomeScor = NULL
+wbike_f$Start_Month = NULL # removing month as we just have 2 months data and that is not significant
+wbike_f$Start_date = NULL # Removing data for the same reasons, we are having day type which gives the significance
+```
+Adding dummy variables to the factor classes
+```{r}
+#converting as factors
+rwbike=wbike_f
+rwbike$sTrpDayType = as.factor(rwbike$sTrpDayType)
+rwbike$HourType = as.factor(rwbike$HourType)
+rwbike$climateCond = as.factor(rwbike$climateCond)
+rwbike$StationID_type = as.factor(rwbike$StationID_type)
+
+library(fastDummies)
+rwbikes = dummy_cols(rwbike)
+
+#removing the factor variables
+rwbikes$sTrpDayType = NULL
+rwbikes$HourType = NULL
+rwbikes$climateCond = NULL
+rwbikes$StationID_type = NULL
+
+
+
+```
+
+**Model**
+
+```{r}
+sample = sample.split(rwbikes$count, SplitRatio = 0.8)
+train_bc = subset(rwbikes, sample == TRUE)
+test_bc = subset(rwbikes,sample == FALSE)
+
+train_bc$count = log1p(train_bc$count)
+
+dtrain = train_bc %>% as.matrix()
+
+
+ControlParamteres <- trainControl(method = "cv",
+                                  number = 5,
+                                  savePredictions = TRUE,
+                                  classProbs = FALSE)
+parametersGrid <-  expand.grid(eta = c(0.1), 
+                               nrounds=c(500),
+                               alpha = 0,
+                               lambda =1)
+ 
+modelxgboost <- train(count~., 
+                  data = dtrain,
+                  method = "xgbLinear",
+                  trControl = ControlParamteres,
+                  tuneGrid=parametersGrid)
+
+X_test = test_bc %>% select(-count) %>% as.matrix()
+preds = predict(modelxgboost, X_test)
+preds=expm1(preds)
+
+results <- tibble(cnt_actual = test_bc$count,
+                  cnt_pred=round(preds))
+results %>% 
+    mutate(resid=cnt_actual - cnt_pred) %>% 
+    mutate(resid_sq = resid^2) %>% 
+    summarise(MSE=mean(resid_sq))
+print(rmse(results$cnt_pred,results$cnt_actual))
+print(rsq(results$cnt_pred,results$cnt_actual))
+
+```
+performing xbgtree to get importance
+```{r}
+X_train = train_bc %>% select(-count) %>% as.matrix()
+y_train = train_bc$count
+
+dtrain = xgb.DMatrix(X_train, label = y_train)
+
+model = xgb.train(booster = "gblinear",data = dtrain, nround = 500, eta = 0.1)
+xgb.importance(feature_names = colnames(X_train), model) %>% xgb.plot.importance()
+
+
+```
+Based on the hypothesis and the significance graph, it shows that hour, temperature, ratio of born UK,Day Type show a significance importance and help in explaining the model to a better extent. 
+
+The final Model gives a better MSE and has variables which explain the effect of trend of count on an hourly basis at the stations, The r squared value is closer to 50% which could get may be better by involving other feature variables like other transport stations, Holidays, Tourist Counts and many more. 
+
+By using the predictions, TFL can categorize the busy stations and may be based on time can allocate different bike capacities or do necessary actions to improve bike health, bike docking when the journey ends, and meeting the demand based on the capacity.
+
+
